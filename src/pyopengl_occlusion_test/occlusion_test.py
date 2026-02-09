@@ -16,12 +16,13 @@ class OcclusionGLWidget(QOpenGLWidget):
         self.test_points = []
         self.calculated_occlusion = []
 
-        # orbital camera
-        self.target = np.array([0.0, 0.0, 0.0])
+        # Orbital camera
+        self.target = np.zeros(3)
         self.distance = 15.0
         self.azimuth = 45.0
         self.elevation = 25.0
         self.last_mouse_pos = None
+        self._pending_occlusion_test = True
 
     # ---------------- OpenGL ----------------
 
@@ -37,19 +38,21 @@ class OcclusionGLWidget(QOpenGLWidget):
         if self.plane_y is None:
             return
 
-        self._setup_camera()
-        self._draw_plane(alpha=0.35)
+        self._setup_matrices()
+        self._draw_plane()
         self._draw_points()
 
     # ---------------- Camera ----------------
 
-    def _setup_camera(self):
-        w, h = self.width(), self.height()
+    def _setup_matrices(self):
+        aspect = self.width() / max(1, self.height())
         GL.glMatrixMode(GL.GL_PROJECTION)
         GL.glLoadIdentity()
-        GLU.gluPerspective(45.0, w / max(1, h), 0.1, 100.0)
+        GLU.gluPerspective(45.0, aspect, 0.1, 100.0)
 
-        az, el = np.radians(self.azimuth), np.radians(self.elevation)
+        # Spherical → Cartesian
+        az = np.radians(self.azimuth)
+        el = np.radians(self.elevation)
         cam_x = self.distance * np.cos(el) * np.sin(az)
         cam_y = self.distance * np.sin(el)
         cam_z = self.distance * np.cos(el) * np.cos(az)
@@ -61,98 +64,115 @@ class OcclusionGLWidget(QOpenGLWidget):
 
     # ---------------- Scene ----------------
 
-    def _draw_plane(self, alpha=0.25):
-        size = 1000.0
+    def _draw_plane(self):
         y = self.plane_y
-
-        # Depth-only pass
-        GL.glDepthMask(True)
-        GL.glColorMask(False, False, False, False)
-        GL.glBegin(GL.GL_TRIANGLES)
-        GL.glVertex3f(-size, y, -size)
-        GL.glVertex3f(size, y, -size)
-        GL.glVertex3f(size, y, size)
-        GL.glVertex3f(-size, y, -size)
-        GL.glVertex3f(size, y, size)
-        GL.glVertex3f(-size, y, size)
-        GL.glEnd()
-
-        # Fill pass
-        GL.glColorMask(True, True, True, True)
-        GL.glDepthMask(False)
-        GL.glEnable(GL.GL_BLEND)
-        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
-        GL.glColor4f(0.2, 0.6, 0.9, alpha)
-        GL.glBegin(GL.GL_QUADS)
-        GL.glVertex3f(-size, y, -size)
-        GL.glVertex3f(size, y, -size)
-        GL.glVertex3f(size, y, size)
-        GL.glVertex3f(-size, y, size)
-        GL.glEnd()
-        GL.glDisable(GL.GL_BLEND)
-        GL.glDepthMask(True)
-
-        # Wireframe
-        GL.glColor3f(0.8, 0.8, 0.8)
-        GL.glLineWidth(1.0)
+        size = 1000.0
         steps = 20
         step_size = size / steps
+
+        # Translucent fill
+        GL.glEnable(GL.GL_BLEND)
+        GL.glBlendFunc(GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA)
+        GL.glColor4f(0.2, 0.6, 0.9, 0.35)
+        GL.glBegin(GL.GL_QUADS)
+        GL.glVertex3f(-size, y, -size)
+        GL.glVertex3f( size, y, -size)
+        GL.glVertex3f( size, y,  size)
+        GL.glVertex3f(-size, y,  size)
+        GL.glEnd()
+        GL.glDisable(GL.GL_BLEND)
+
+        # Wireframe grid
+        GL.glColor3f(0.8, 0.8, 0.8)
+        GL.glLineWidth(1.0)
         GL.glBegin(GL.GL_LINES)
         for i in range(-steps, steps + 1):
             x = i * step_size
             GL.glVertex3f(x, y, -size)
-            GL.glVertex3f(x, y, size)
+            GL.glVertex3f(x, y,  size)
             z = i * step_size
             GL.glVertex3f(-size, y, z)
-            GL.glVertex3f(size, y, z)
+            GL.glVertex3f( size, y, z)
         GL.glEnd()
 
-    def _draw_points(self):
+    def _draw_points(self, not_draw=False):
+        if not_draw:
+            return
         GL.glPointSize(8.0)
         GL.glBegin(GL.GL_POINTS)
         for p, occ in zip(self.test_points, self.calculated_occlusion):
-            GL.glColor3f(1.0, 0.2, 0.2) if occ else GL.glColor3f(0.2, 1.0, 0.2)
+            GL.glColor3f(0.2, 1.0, 0.2) if occ else GL.glColor3f(1.0, 0.2, 0.2)
             GL.glVertex3f(*p)
         GL.glEnd()
 
     # ---------------- Occlusion logic ----------------
 
-    def run_occlusion_test(self):
-        """Use OpenGL occlusion queries to check each point."""
-        self.makeCurrent()
-        self.calculated_occlusion.clear()
+    def request_occlusion_test(self):
+        self._pending_occlusion_test = True
+        self.update()  # trigger repaint
 
-        # Prepare camera & depth buffer
-        self._setup_camera()
+    def paintGL(self):
         GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
-        self._draw_plane(alpha=0.35)
 
-        # For each point, test if any pixel passes depth test
-        for p in self.test_points:
+        if self.plane_y is None:
+            return
+
+        self._setup_matrices()
+
+        self._draw_plane()
+
+        if self._pending_occlusion_test:
+            self._pending_occlusion_test = False
+            self.calculated_occlusion = list(self._run_occlusion_queries(self.test_points))
+            print("="*25)
+            for idx, passed in enumerate(self.calculated_occlusion):
+                print(f"Point {idx:02d}: {'Occluded' if not passed else 'Visible'}")
+
+        self._draw_points()  # Don't write depth/color, just visualize
+
+
+    def _run_occlusion_queries(self, points):
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glDepthMask(False)
+        GL.glColorMask(False, False, False, False)
+        GL.glPointSize(1.0)
+
+        for p in points:
             query = GL.glGenQueries(1)[0]
+
             GL.glBeginQuery(GL.GL_ANY_SAMPLES_PASSED, query)
+
             GL.glBegin(GL.GL_POINTS)
             GL.glVertex3f(*p)
             GL.glEnd()
+
             GL.glEndQuery(GL.GL_ANY_SAMPLES_PASSED)
-            result = GL.glGetQueryObjectuiv(query, GL.GL_QUERY_RESULT)
-            self.calculated_occlusion.append(not bool(result))
+
+            yield bool(GL.glGetQueryObjectuiv(query, GL.GL_QUERY_RESULT))
+
             GL.glDeleteQueries(1, [query])
 
-        self.update()
+        GL.glColorMask(True, True, True, True)
+        GL.glDepthMask(True)
+
 
     # ---------------- Input ----------------
 
     def mousePressEvent(self, e):
-        self.last_mouse_pos = e.pos()
+        self.last_mouse_pos = e.position().toPoint()
 
     def mouseMoveEvent(self, e):
         if self.last_mouse_pos is None:
             return
-        dx, dy = e.x() - self.last_mouse_pos.x(), e.y() - self.last_mouse_pos.y()
+
+        pos = e.position().toPoint()
+        dx = pos.x() - self.last_mouse_pos.x()
+        dy = pos.y() - self.last_mouse_pos.y()
+
         self.azimuth += dx * 0.5
         self.elevation = np.clip(self.elevation + dy * 0.5, -89, 89)
-        self.last_mouse_pos = e.pos()
+
+        self.last_mouse_pos = pos
         self.update()
 
     def wheelEvent(self, e):
@@ -166,15 +186,13 @@ class OcclusionGLWidget(QOpenGLWidget):
         np.random.seed(42)
         self.plane_y = np.random.uniform(-2, 2)
         self.test_points = [np.random.uniform(-5, 5, 3) for _ in range(n)]
-        self.calculated_occlusion = [False] * n
+        self.calculated_occlusion = []
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not any(self.calculated_occlusion):
-            QTimer.singleShot(50, self.run_occlusion_test)
+        if not self.calculated_occlusion:
+            QTimer.singleShot(50, self.request_occlusion_test)
 
-
-# ---------------- Main Window ----------------
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -183,7 +201,7 @@ class MainWindow(QWidget):
         self.gl = OcclusionGLWidget()
 
         btn = QPushButton("Run occlusion test")
-        btn.clicked.connect(self.gl.run_occlusion_test)
+        btn.clicked.connect(self.gl.request_occlusion_test)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.gl, 1)
