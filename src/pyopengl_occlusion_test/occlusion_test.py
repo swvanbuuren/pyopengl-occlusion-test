@@ -4,10 +4,10 @@ import numpy as np
 from OpenGL import GL, GLU
 
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QPushButton, QTextEdit
+    QApplication, QWidget, QVBoxLayout, QPushButton
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer
 
 
 class OcclusionGLWidget(QOpenGLWidget):
@@ -224,6 +224,7 @@ class OcclusionGLWidget(QOpenGLWidget):
 
         self.test_points.clear()
         self.expected_occlusion.clear()
+        self.calculated_occlusion.clear()
 
         for _ in range(n):
             p = np.random.uniform(-5, 5, 3)
@@ -236,6 +237,9 @@ class OcclusionGLWidget(QOpenGLWidget):
                 t = (self.plane_y - self.camera_pos[1]) / ray[1]
                 self.expected_occlusion.append(0 < t < 1)
 
+        # Immediately calculate occlusion so the scene is correct at start
+        #self.run_occlusion_test()
+
 
     def update_camera_position(self):
         az = np.radians(self.azimuth)
@@ -246,6 +250,12 @@ class OcclusionGLWidget(QOpenGLWidget):
         cam_z = self.distance * np.cos(el) * np.cos(az)
 
         self.camera_pos = np.array([cam_x, cam_y, cam_z])
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Run occlusion test after the widget is shown and OpenGL context is ready
+        if not self.calculated_occlusion:  # avoid rerunning multiple times
+            QTimer.singleShot(50, self.run_occlusion_test)
 
 
 class MainWindow(QWidget):
